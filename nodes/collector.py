@@ -151,44 +151,44 @@ class DistributedCollectorNode:
         )
         return result
 
+    def _completion_payloads(self, image_batch, encoded_audio, multi_job_id, worker_id):
+        """Yield one completion envelope at a time, encoding each frame on demand."""
+        batch_size = 0 if image_batch is None else image_batch.shape[0]
+        if batch_size == 0:
+            if encoded_audio is None:
+                raise ValueError("Worker completion requires image or audio data")
+            yield {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "batch_idx": 0,
+                "audio": encoded_audio,
+                "is_last": True,
+            }
+            return
+
+        for batch_idx in range(batch_size):
+            img = tensor_to_pil(image_batch[batch_idx:batch_idx+1], 0)
+            byte_io = io.BytesIO()
+            img.save(byte_io, format='PNG', compress_level=0)
+            encoded_image = base64.b64encode(byte_io.getvalue()).decode('utf-8')
+            payload = {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "batch_idx": int(batch_idx),
+                "image": f"data:image/png;base64,{encoded_image}",
+                "is_last": bool(batch_idx == batch_size - 1),
+            }
+            if payload["is_last"] and encoded_audio is not None:
+                payload["audio"] = encoded_audio
+            yield payload
+
     async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
         """Send an image batch, optionally with audio, or an audio-only completion."""
         encoded_audio = encode_audio_payload(audio)
         session = await get_client_session()
         url = f"{master_url}/distributed/job_complete"
 
-        payloads = []
-        batch_size = 0 if image_batch is None else image_batch.shape[0]
-        if batch_size == 0:
-            if encoded_audio is None:
-                raise ValueError("Worker completion requires image or audio data")
-            payloads.append(
-                {
-                    "job_id": str(multi_job_id),
-                    "worker_id": str(worker_id),
-                    "batch_idx": 0,
-                    "audio": encoded_audio,
-                    "is_last": True,
-                }
-            )
-        else:
-            for batch_idx in range(batch_size):
-                img = tensor_to_pil(image_batch[batch_idx:batch_idx+1], 0)
-                byte_io = io.BytesIO()
-                img.save(byte_io, format='PNG', compress_level=0)
-                encoded_image = base64.b64encode(byte_io.getvalue()).decode('utf-8')
-                payload = {
-                    "job_id": str(multi_job_id),
-                    "worker_id": str(worker_id),
-                    "batch_idx": int(batch_idx),
-                    "image": f"data:image/png;base64,{encoded_image}",
-                    "is_last": bool(batch_idx == batch_size - 1),
-                }
-                if payload["is_last"] and encoded_audio is not None:
-                    payload["audio"] = encoded_audio
-                payloads.append(payload)
-
-        for payload in payloads:
+        for payload in self._completion_payloads(image_batch, encoded_audio, multi_job_id, worker_id):
             timeout_seconds = 60 if "image" in payload else 600
             try:
                 async with session.post(
