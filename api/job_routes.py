@@ -12,7 +12,6 @@ import torch
 from PIL import Image
 
 from ..utils.logging import debug_log
-from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
 try:
@@ -102,7 +101,11 @@ def _check_file_sync(filename, expected_hash):
 
 
 def _decode_canonical_png_tensor(image_payload):
-    """Decode canonical base64 PNG payload into a contiguous IMAGE tensor."""
+    """Decode canonical base64 PNG payload into a uint8 [1, H, W, 3] tensor.
+
+    Stays 8-bit so collected frames occupy a quarter of the float32 equivalent
+    until the collector assembles them.
+    """
     if not isinstance(image_payload, str) or not image_payload.strip():
         raise ValueError("Field 'image' must be a non-empty base64 PNG string.")
 
@@ -125,9 +128,10 @@ def _decode_canonical_png_tensor(image_payload):
 
     try:
         with Image.open(io.BytesIO(png_bytes)) as img:
-            img = img.convert("RGB")
-            tensor = pil_to_tensor(img)
-        return ensure_contiguous(tensor)
+            rgb = img.convert("RGB")
+            width, height = rgb.size
+            pixels = bytearray(rgb.tobytes())
+        return torch.frombuffer(pixels, dtype=torch.uint8).view(1, height, width, 3)
     except Exception as exc:
         raise ValueError(f"Failed to decode PNG image payload: {exc}") from exc
 

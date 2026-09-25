@@ -275,6 +275,28 @@ class DistributedCollectorNode:
         worker_images[worker_id][image_index] = tensor
         return 1
 
+    @staticmethod
+    def _write_images(destination, source):
+        """Copy source frames into destination, scaling 8-bit sources to unit range."""
+        if source.is_cuda:
+            source = source.cpu()
+        if source.dtype == torch.uint8:
+            torch.div(source, 255.0, out=destination)
+        else:
+            destination.copy_(source)
+
+    @staticmethod
+    def _worker_id_order(worker_images: dict, worker_order: list) -> list:
+        configured = [str(worker_id) for worker_id in (worker_order or [])]
+        return configured + sorted(set(worker_images) - set(configured))
+
+    def _take_worker_images(self, worker_images: dict, worker_order: list):
+        """Yield collected frames in order, releasing each from worker_images as it goes."""
+        for worker_id in self._worker_id_order(worker_images, worker_order):
+            frames = worker_images.get(worker_id) or {}
+            for index in sorted(frames):
+                yield frames.pop(index)
+
     def _reorder_and_combine_tensors(
         self,
         worker_images: dict,
@@ -285,39 +307,28 @@ class DistributedCollectorNode:
         fallback_images,
     ):
         """Assemble final tensor, or return None when the job contains only audio."""
-        ordered_tensors = []
-        if not delegate_mode and images_on_cpu is not None:
-            for i in range(master_batch_size):
-                ordered_tensors.append(images_on_cpu[i:i+1])
+        master_images = None if delegate_mode else images_on_cpu
+        master_rows = 0 if master_images is None else min(master_batch_size, master_images.shape[0])
+        total_rows = master_rows + sum(len(frames) for frames in worker_images.values())
 
-        ordered_worker_ids = [str(worker_id) for worker_id in (worker_order or [])]
-        seen = set()
-        for worker_id_str in ordered_worker_ids:
-            seen.add(worker_id_str)
-            if worker_id_str not in worker_images:
-                continue
-            for idx in sorted(worker_images[worker_id_str].keys()):
-                ordered_tensors.append(worker_images[worker_id_str][idx])
+        if total_rows == 0:
+            return ensure_contiguous(fallback_images) if fallback_images is not None else None
 
-        # Append any unexpected worker ids deterministically.
-        for worker_id_str in sorted(worker_images.keys()):
-            if worker_id_str in seen:
-                continue
-            for idx in sorted(worker_images[worker_id_str].keys()):
-                ordered_tensors.append(worker_images[worker_id_str][idx])
+        sample = master_images if master_rows else next(
+            frame for frames in worker_images.values() for frame in frames.values()
+        )
+        combined = torch.empty((total_rows, *sample.shape[1:]), dtype=torch.float32)
 
-        cpu_tensors = []
-        for t in ordered_tensors:
-            if t.is_cuda:
-                t = t.cpu()
-            t = ensure_contiguous(t)
-            cpu_tensors.append(t)
+        if master_rows:
+            self._write_images(combined[:master_rows], master_images[:master_rows])
 
-        if cpu_tensors:
-            return ensure_contiguous(torch.cat(cpu_tensors, dim=0))
-        if fallback_images is not None:
-            return ensure_contiguous(fallback_images)
-        return None
+        offset = master_rows
+        for frame in self._take_worker_images(worker_images, worker_order):
+            rows = frame.shape[0]
+            self._write_images(combined[offset:offset + rows], frame)
+            offset += rows
+
+        return combined
 
     async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
