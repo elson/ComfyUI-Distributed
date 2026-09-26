@@ -80,6 +80,23 @@ def _audio_only_prompt():
     }
 
 
+def _video_only_prompt():
+    """1(KSampler) + 2(VAELoader) → 3(VHS_VideoCombine) → 4(DistributedCollector) → 5(PreviewAny).
+
+    The latent goes straight into Video Combine alongside the VAE, which is how VHS
+    avoids materialising the frame batch ("If provided, the node will take latents as
+    input instead of images. This drastically reduces the required RAM"). That makes the
+    VAELoader part of the collector's upstream, so the worker needs it too.
+    """
+    return {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "VAELoader", "inputs": {}},
+        "3": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["1", 0], "vae": ["2", 0]}},
+        "4": {"class_type": "DistributedCollector", "inputs": {"video": ["3", 0]}},
+        "5": {"class_type": "PreviewAny", "inputs": {"source": ["4", 2]}},
+    }
+
+
 def _delegate_prompt():
     """1 → 2 → 3(DistributedCollector) → 4(SaveImage)"""
     return {
@@ -260,6 +277,41 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewImage"]
         self.assertEqual(len(preview_nodes), 0)
 
+    def test_video_only_worker_keeps_video_combine_and_vae(self):
+        """A Video Combine feeding the collector's video input survives, and so does its VAE.
+
+        _find_upstream_nodes walks every inputs value with no allow-list, so a new
+        optional input needs no change here.
+        """
+        result = pt.prune_prompt_for_worker(_video_only_prompt())
+        for node_id in ("1", "2", "3", "4"):
+            self.assertIn(node_id, result)
+        self.assertNotIn("5", result)
+
+    def test_video_only_worker_gets_a_terminal_consuming_the_collector(self):
+        """Without a terminal the worker encodes the video and silently sends nothing.
+
+        The collector is not an OUTPUT_NODE, so on the pruned worker graph it only runs
+        if some node consumes one of its outputs. For images and audio this method
+        injects PreviewImage / PreviewAudio. For video nothing is injected, and because
+        VHS_VideoCombine is itself an OUTPUT_NODE the pruned graph still validates -- so
+        the worker does all the GPU work, finishes the prompt, and never posts a result.
+        The master then waits out its worker timeout and falls back.
+        """
+        result = pt.prune_prompt_for_worker(_video_only_prompt())
+        consumers = [
+            node_id
+            for node_id, node in result.items()
+            if any(
+                isinstance(value, list) and len(value) == 2 and str(value[0]) == "4"
+                for value in node.get("inputs", {}).values()
+            )
+        ]
+        self.assertTrue(
+            consumers,
+            "nothing consumes the collector's output, so it will never execute on the worker",
+        )
+
     def test_unrelated_nodes_are_pruned(self):
         prompt = {
             "1": {"class_type": "DistributedCollector", "inputs": {}},
@@ -330,6 +382,23 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertEqual(empty_nodes, [])
         self.assertNotIn("images", result["2"].get("inputs", {}))
         self.assertNotIn("audio", result["2"].get("inputs", {}))
+
+    def test_video_only_collector_does_not_get_image_placeholder(self):
+        """The delegate master pops the video link and gets no placeholder, exactly like audio.
+
+        Video Combine is not a safe-scalar upstream, so it is pruned off the master and
+        the dangling-reference sweep removes the collector's video input. The
+        DistributedEmptyImage placeholder is images-only by an explicit check, so nothing
+        is substituted -- which is why the collector's guard has to tolerate a
+        video-less invocation on the master.
+        """
+        prompt = _video_only_prompt()
+        result = pt.prepare_delegate_master_prompt(prompt, ["4"])
+        empty_nodes = [n for n in result.values() if n.get("class_type") == "DistributedEmptyImage"]
+        self.assertEqual(empty_nodes, [])
+        self.assertNotIn("video", result["4"].get("inputs", {}))
+        self.assertNotIn("3", result)
+        self.assertIn("5", result)
 
     def test_one_placeholder_per_collector(self):
         """Two collectors → two placeholders."""

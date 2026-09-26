@@ -2,6 +2,8 @@ import torch
 import io
 import json
 import asyncio
+import hashlib
+import os
 import time
 import base64
 
@@ -19,6 +21,11 @@ from ..utils.audio_payload import encode_audio_payload
 from ..utils.async_helpers import run_async_in_server_loop
 
 prompt_server = _server.PromptServer.instance
+
+# One request carries the whole job's output, so it is worth retrying, and it can be large
+# enough that the per-frame 60s timeout would be far too tight.
+VIDEO_SEND_ATTEMPTS = 5
+VIDEO_SEND_TIMEOUT = 1800
 
 
 class DistributedCollectorNode:
@@ -40,6 +47,14 @@ class DistributedCollectorNode:
             "optional": {
                 "images": ("IMAGE",),
                 "audio": ("AUDIO",),
+                "video": (
+                    "VHS_FILENAMES",
+                    {
+                        "tooltip": "Connect a Video Combine here to have the worker encode the "
+                                   "video and send only the finished file, instead of every "
+                                   "frame as a separate image.",
+                    },
+                ),
             },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
@@ -53,8 +68,8 @@ class DistributedCollectorNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "VHS_FILENAMES")
+    RETURN_NAMES = ("images", "audio", "video")
     FUNCTION = "run"
     CATEGORY = "image"
     
@@ -104,10 +119,46 @@ class DistributedCollectorNode:
             return None
         return {"waveform": torch.cat(waveforms, dim=-1), "sample_rate": sample_rate}
 
-    def run(self, images=None, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    @staticmethod
+    def _normalize_video_input(video):
+        """Collapse a list VHS_FILENAMES input into a single (save_output, paths) pair."""
+        if video is None:
+            return None
+        if isinstance(video, list) and len(video) == 1:
+            video = video[0]
+        if isinstance(video, (list, tuple)) and len(video) == 2:
+            save_output, paths = video
+            if isinstance(paths, (list, tuple)):
+                return (bool(save_output), list(paths))
+        raise ValueError(
+            "DistributedCollector video input must be a VHS_FILENAMES pair "
+            "of (save_output, [paths])"
+        )
+
+    @staticmethod
+    def _video_path_from_filenames(video):
+        """Pick the file a VHS_FILENAMES value refers to.
+
+        Video Combine appends the muxed result last, and appends the '-audio.<ext>'
+        variant after it when audio is wired, so the final entry is always the one to
+        send. An empty list is not a file: Video Combine returns (save_output, []) for a
+        zero-frame batch and for an unfinished Meta Batch, and posting nothing there would
+        leave the master waiting out its worker timeout for no reason.
+        """
+        paths = video[1] if video else None
+        if not paths:
+            raise ValueError(
+                "DistributedCollector received an empty video input. Video Combine "
+                "produced no file - it had no frames, or it is mid-way through a Meta "
+                "Batch, which cannot be collected."
+            )
+        return paths[-1]
+
+    def run(self, images=None, load_balance=False, audio=None, video=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
         if images is not None:
             images = self._normalize_images_input(images)
         audio = self._normalize_audio_input(audio)
+        video = self._normalize_video_input(video)
         load_balance = self._unwrap_list_input(load_balance)
         multi_job_id = self._unwrap_list_input(multi_job_id)
         is_worker = self._unwrap_list_input(is_worker)
@@ -123,8 +174,10 @@ class DistributedCollectorNode:
             and not is_worker
             and (delegate_only or is_master_delegate_only())
         )
-        if images is None and audio is None and not remote_only_master:
-            raise ValueError("DistributedCollector requires at least one image or audio input")
+        if images is None and audio is None and video is None and not remote_only_master:
+            raise ValueError(
+                "DistributedCollector requires at least one image, audio, or video input"
+            )
 
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
@@ -132,13 +185,14 @@ class DistributedCollectorNode:
         if not multi_job_id or pass_through:
             if pass_through:
                 debug_log("Collector: pass-through mode enabled, returning images unchanged")
-            return (images, audio if audio is not None else empty_audio)
+            return (images, audio if audio is not None else empty_audio, video)
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
             self.execute(
                 images,
                 audio,
+                video,
                 load_balance,
                 multi_job_id,
                 is_worker,
@@ -181,6 +235,71 @@ class DistributedCollectorNode:
             if payload["is_last"] and encoded_audio is not None:
                 payload["audio"] = encoded_audio
             yield payload
+    async def send_video_to_master(self, video, multi_job_id, master_url, worker_id):
+        """Stream one finished video file to the master as multipart.
+
+        Deliberately not a JSON envelope. The whole point of collecting a video instead of
+        frames is to stop holding a clip in memory, and base64 inside JSON would undo that
+        on the master, which is frequently the CPU-only box. aiohttp streams from the file
+        object and sets Content-Length from fstat, which is also what lets the master
+        reject an oversized body before reading it.
+
+        Retried, unlike the per-frame path: this single request carries the entire result
+        of the job, so losing it to one transient error throws away all the GPU work.
+        """
+        path = self._video_path_from_filenames(video)
+        if not os.path.exists(path):
+            raise ValueError(f"DistributedCollector video file does not exist: {path}")
+
+        basename = os.path.basename(path)
+        file_hash = await asyncio.to_thread(self._file_md5, path)
+        size = os.path.getsize(path)
+        session = await get_client_session()
+        url = f"{master_url}/distributed/job_complete_video"
+        debug_log(
+            f"Worker - Sending video '{basename}' ({size} bytes, md5 {file_hash[:8]}) to master"
+        )
+
+        last_error = None
+        for attempt in range(VIDEO_SEND_ATTEMPTS):
+            try:
+                # Reopened per attempt: a retried upload cannot reuse a consumed handle.
+                with open(path, "rb") as handle:
+                    form = aiohttp.FormData()
+                    form.add_field("job_id", str(multi_job_id))
+                    form.add_field("worker_id", str(worker_id))
+                    form.add_field("basename", basename)
+                    form.add_field("md5", file_hash)
+                    form.add_field("is_last", "true")
+                    form.add_field(
+                        "video", handle, filename=basename, content_type="video/mp4"
+                    )
+                    async with session.post(
+                        url,
+                        data=form,
+                        timeout=aiohttp.ClientTimeout(total=VIDEO_SEND_TIMEOUT),
+                    ) as response:
+                        response.raise_for_status()
+                return
+            except Exception as exc:
+                last_error = exc
+                log(
+                    f"Worker - Failed to send video envelope to master "
+                    f"(attempt {attempt + 1}/{VIDEO_SEND_ATTEMPTS}): {exc}"
+                )
+                debug_log(f"Worker - Full error details: URL={url}")
+                if attempt + 1 < VIDEO_SEND_ATTEMPTS:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_error
+
+    @staticmethod
+    def _file_md5(path):
+        """md5 a file in chunks, matching how _check_file_sync hashes."""
+        digest = hashlib.md5()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
         """Send an image batch, optionally with audio, or an audio-only completion."""
@@ -258,6 +377,43 @@ class DistributedCollectorNode:
             log(f"[Distributed] Master - Audio combination failed, returning silence: {e}")
             return empty_audio
 
+    def _combine_videos(self, master_video, worker_videos, worker_order=None):
+        """Collect video files into one VHS_FILENAMES value: master first, then workers.
+
+        Returns None when the job produced no video, so an images-or-audio job leaves the
+        third output empty. The files are not concatenated - each participant encoded its
+        own clip, and joining them is a separate problem with its own seam and timebase
+        handling. VHS_FILENAMES is a list, so Select Filename and Prune Outputs both keep
+        working on the result.
+        """
+        paths = []
+        if master_video:
+            paths.extend(master_video[1])
+
+        ordered_ids = [str(worker_id) for worker_id in (worker_order or [])]
+        for worker_id_str in ordered_ids:
+            path = worker_videos.get(worker_id_str)
+            if path:
+                paths.append(path)
+
+        # Anything from a worker that was not in the configured order still counts.
+        for worker_id_str in sorted(set(worker_videos) - set(ordered_ids)):
+            path = worker_videos.get(worker_id_str)
+            if path:
+                paths.append(path)
+
+        if not paths:
+            return None
+        if len(paths) > 1:
+            log(
+                f"[Distributed] Master - Collected {len(paths)} separate video files "
+                f"({len(worker_videos)} worker(s)"
+                f"{' + master' if master_video else ''}). They are not joined into one "
+                f"clip; use Select Filename to pick one."
+            )
+        debug_log(f"Master - Combined video filenames: {paths}")
+        return (True, paths)
+
     def _store_worker_result(self, worker_images: dict, item: dict) -> int:
         """Store one canonical queue item in worker_images in-place.
 
@@ -330,13 +486,23 @@ class DistributedCollectorNode:
 
         return combined
 
-    async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+    async def execute(self, images, audio, video, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
-            # Worker mode: send images and audio to master in a single batch
-            image_count = 0 if images is None else images.shape[0]
-            debug_log(f"Worker - Job {multi_job_id} complete. Sending {image_count} image(s) to master")
-            await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
-            return (images, audio if audio is not None else self.EMPTY_AUDIO)
+            if video is not None:
+                # The encoded file supersedes the frames: sending both would ship the same
+                # pixels twice, once compressed and once as raw PNG, which is the cost this
+                # path exists to avoid.
+                debug_log(
+                    f"Worker - Job {multi_job_id} complete. Sending one video file to master"
+                    + (" (frames present but not sent)" if images is not None else "")
+                )
+                await self.send_video_to_master(video, multi_job_id, master_url, worker_id)
+            else:
+                # Worker mode: send images and audio to master in a single batch
+                image_count = 0 if images is None else images.shape[0]
+                debug_log(f"Worker - Job {multi_job_id} complete. Sending {image_count} image(s) to master")
+                await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
+            return (images, audio if audio is not None else self.EMPTY_AUDIO, video)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
             # Master mode: collect images and audio from workers
@@ -352,7 +518,7 @@ class DistributedCollectorNode:
             expected_workers = set(enabled_workers)
             num_workers = len(expected_workers)
             if num_workers == 0:
-                return (images, audio if audio is not None else self.EMPTY_AUDIO)
+                return (images, audio if audio is not None else self.EMPTY_AUDIO, video)
 
             # Create the queue before any expensive local work to avoid job_complete race.
             async with prompt_server.distributed_jobs_lock:
@@ -378,10 +544,14 @@ class DistributedCollectorNode:
                 master_audio = audio  # Keep master's audio for later
                 debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
 
+            master_video = None if delegate_mode else video
 
             # Initialize storage for collected images and audio
             worker_images = {}  # Dict to store images by worker_id and index
             worker_audio = {}   # Dict to store audio by worker_id
+            # Videos are kept apart from worker_images on purpose: the assembler counts one
+            # row per stored item, so a non-tensor entry there would corrupt the row count.
+            worker_videos = {}  # Dict to store one received video path by worker_id
             
             # Collect images until all workers report they're done
             collected_count = 0
@@ -441,6 +611,12 @@ class DistributedCollectorNode:
                         if result_audio is not None:
                             worker_audio[worker_id] = result_audio
                             debug_log(f"Master - Got audio from worker {worker_id}")
+
+                        # Collect a received video file if present
+                        result_video = result.get('video_path')
+                        if result_video is not None:
+                            worker_videos[worker_id] = result_video
+                            debug_log(f"Master - Got video from worker {worker_id}: {result_video}")
 
                         # Record activity and refresh timeout baseline
                         last_activity = time.time()
@@ -550,18 +726,24 @@ class DistributedCollectorNode:
                     del prompt_server.distributed_pending_jobs[multi_job_id]
 
             combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
+            combined_video = self._combine_videos(master_video, worker_videos, enabled_workers)
             try:
                 combined = self._reorder_and_combine_tensors(
                     worker_images, enabled_workers, master_batch_size, images_on_cpu, delegate_mode, images
                 )
-                if combined is None:
+                if combined is None and combined_video is not None:
+                    debug_log(
+                        f"Master - Job {multi_job_id} complete with "
+                        f"{len(combined_video[1])} video file(s)"
+                    )
+                elif combined is None:
                     debug_log(f"Master - Job {multi_job_id} complete with audio only")
                 else:
                     debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
                               f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
 
-                return (combined, combined_audio)
+                return (combined, combined_audio, combined_video)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
-                # Preserve collected audio even when image assembly fails.
-                return (images, combined_audio)
+                # Preserve collected audio and video even when image assembly fails.
+                return (images, combined_audio, combined_video)

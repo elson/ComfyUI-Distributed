@@ -363,6 +363,11 @@ def prune_prompt_for_worker(prompt_obj):
                 and isinstance(inputs.get("audio"), list)
                 and len(inputs["audio"]) == 2
             )
+            video_connected = (
+                class_type == "DistributedCollector"
+                and isinstance(inputs.get("video"), list)
+                and len(inputs["video"]) == 2
+            )
 
             if image_connected:
                 preview_id = next_id()
@@ -377,6 +382,19 @@ def prune_prompt_for_worker(prompt_obj):
                     "inputs": {"audio": [dist_id, 1]},
                     "class_type": "PreviewAudio",
                     "_meta": {"title": "Preview Audio (auto-added)"},
+                }
+            elif video_connected:
+                # The collector is not an OUTPUT_NODE, so without a terminal it never
+                # executes on the pruned worker graph. Unlike the image case that is not
+                # a loud failure: VHS_VideoCombine is itself an OUTPUT_NODE, so the graph
+                # validates, the worker encodes the video, and nothing is ever posted.
+                # PreviewAny is core (since ComfyUI 0.3.32) and takes IO.ANY, so it can
+                # terminate a VHS_FILENAMES wire without this file knowing the type.
+                preview_id = next_id()
+                pruned_prompt[preview_id] = {
+                    "inputs": {"source": [dist_id, 2]},
+                    "class_type": "PreviewAny",
+                    "_meta": {"title": "Preview Any (auto-added)"},
                 }
 
     return pruned_prompt
