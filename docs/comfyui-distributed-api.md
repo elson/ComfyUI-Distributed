@@ -181,7 +181,7 @@ If you call the API from a browser (not from a backend), ensure the master Comfy
 ## Endpoint: `POST /distributed/job_complete_video`
 
 Submit one finished video file back to the master collector queue, instead of the frames it
-was made from. Used when a `Video Combine` is connected to the collector's `video` input: the
+was made from. Used when a `Video Combine` is connected to the collector's `filenames` input: the
 worker encodes the clip and sends only the file, which for a long sequence is orders of
 magnitude less data than one base64 PNG per frame.
 

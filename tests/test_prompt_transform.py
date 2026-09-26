@@ -92,7 +92,7 @@ def _video_only_prompt():
         "1": {"class_type": "KSampler", "inputs": {}},
         "2": {"class_type": "VAELoader", "inputs": {}},
         "3": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["1", 0], "vae": ["2", 0]}},
-        "4": {"class_type": "DistributedCollector", "inputs": {"video": ["3", 0]}},
+        "4": {"class_type": "DistributedCollector", "inputs": {"filenames": ["3", 0]}},
         "5": {"class_type": "PreviewAny", "inputs": {"source": ["4", 2]}},
     }
 
@@ -396,7 +396,7 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         result = pt.prepare_delegate_master_prompt(prompt, ["4"])
         empty_nodes = [n for n in result.values() if n.get("class_type") == "DistributedEmptyImage"]
         self.assertEqual(empty_nodes, [])
-        self.assertNotIn("video", result["4"].get("inputs", {}))
+        self.assertNotIn("filenames", result["4"].get("inputs", {}))
         self.assertNotIn("3", result)
         self.assertIn("5", result)
 

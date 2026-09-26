@@ -25,9 +25,9 @@ class DistributedSaveVideo:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video": (
+                "filenames": (
                     "VHS_FILENAMES",
-                    {"tooltip": "The collected video, from a Distributed Collector's video output."},
+                    {"tooltip": "The collected video, from a Distributed Collector's filenames output."},
                 ),
                 "filename_prefix": (
                     "STRING",
@@ -50,7 +50,7 @@ class DistributedSaveVideo:
         }
 
     RETURN_TYPES = ("VHS_FILENAMES",)
-    RETURN_NAMES = ("video",)
+    RETURN_NAMES = ("filenames",)
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = "image"
@@ -59,8 +59,8 @@ class DistributedSaveVideo:
         "without re-encoding it."
     )
 
-    def save(self, video, filename_prefix="video/ComfyUI", save_output=True):
-        paths = self._source_paths(video)
+    def save(self, filenames, filename_prefix="video/ComfyUI", save_output=True):
+        paths = self._source_paths(filenames)
         if not paths:
             log("[Distributed] SaveVideo - nothing to save: the video input carried no files")
             return {"ui": {"images": [], "animated": (True,)}, "result": ((save_output, []),)}
@@ -150,15 +150,15 @@ class DistributedSaveVideo:
         return None, ""
 
     @staticmethod
-    def _source_paths(video):
+    def _source_paths(filenames):
         """Read the file list out of a VHS_FILENAMES value, tolerating the list wrapper."""
-        if isinstance(video, list) and len(video) == 1:
-            video = video[0]
-        if not (isinstance(video, (list, tuple)) and len(video) == 2):
+        if isinstance(filenames, list) and len(filenames) == 1:
+            filenames = filenames[0]
+        if not (isinstance(filenames, (list, tuple)) and len(filenames) == 2):
             raise ValueError(
                 "DistributedSaveVideo expects a VHS_FILENAMES pair of (save_output, [paths])"
             )
-        paths = video[1]
+        paths = filenames[1]
         return list(paths) if isinstance(paths, (list, tuple)) else []
 
     @staticmethod

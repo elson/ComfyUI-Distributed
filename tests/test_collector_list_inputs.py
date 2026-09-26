@@ -343,7 +343,7 @@ def test_audio_only_master_combines_local_and_worker_audio():
         collector.execute(
             images=None,
             audio=master_audio,
-            video=None,
+            filenames=None,
             multi_job_id="audio-job",
             enabled_worker_ids='["worker-a"]',
         )
@@ -377,7 +377,7 @@ def test_delegate_only_audio_collects_worker_audio_without_placeholder_image():
         collector.execute(
             images=None,
             audio=None,
-            video=None,
+            filenames=None,
             multi_job_id="delegate-audio-job",
             enabled_worker_ids='["worker-a"]',
             delegate_only=True,

@@ -47,7 +47,7 @@ class DistributedCollectorNode:
             "optional": {
                 "images": ("IMAGE",),
                 "audio": ("AUDIO",),
-                "video": (
+                "filenames": (
                     "VHS_FILENAMES",
                     {
                         "tooltip": "Connect a Video Combine here to have the worker encode the "
@@ -69,7 +69,7 @@ class DistributedCollectorNode:
         }
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "VHS_FILENAMES")
-    RETURN_NAMES = ("images", "audio", "video")
+    RETURN_NAMES = ("images", "audio", "filenames")
     FUNCTION = "run"
     CATEGORY = "image"
     
@@ -131,7 +131,7 @@ class DistributedCollectorNode:
             if isinstance(paths, (list, tuple)):
                 return (bool(save_output), list(paths))
         raise ValueError(
-            "DistributedCollector video input must be a VHS_FILENAMES pair "
+            "DistributedCollector filenames input must be a VHS_FILENAMES pair "
             "of (save_output, [paths])"
         )
 
@@ -148,17 +148,17 @@ class DistributedCollectorNode:
         paths = video[1] if video else None
         if not paths:
             raise ValueError(
-                "DistributedCollector received an empty video input. Video Combine "
+                "DistributedCollector received an empty filenames input. Video Combine "
                 "produced no file - it had no frames, or it is mid-way through a Meta "
                 "Batch, which cannot be collected."
             )
         return paths[-1]
 
-    def run(self, images=None, load_balance=False, audio=None, video=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images=None, load_balance=False, audio=None, filenames=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
         if images is not None:
             images = self._normalize_images_input(images)
         audio = self._normalize_audio_input(audio)
-        video = self._normalize_video_input(video)
+        filenames = self._normalize_video_input(filenames)
         load_balance = self._unwrap_list_input(load_balance)
         multi_job_id = self._unwrap_list_input(multi_job_id)
         is_worker = self._unwrap_list_input(is_worker)
@@ -174,7 +174,7 @@ class DistributedCollectorNode:
             and not is_worker
             and (delegate_only or is_master_delegate_only())
         )
-        if images is None and audio is None and video is None and not remote_only_master:
+        if images is None and audio is None and filenames is None and not remote_only_master:
             raise ValueError(
                 "DistributedCollector requires at least one image, audio, or video input"
             )
@@ -185,14 +185,14 @@ class DistributedCollectorNode:
         if not multi_job_id or pass_through:
             if pass_through:
                 debug_log("Collector: pass-through mode enabled, returning images unchanged")
-            return (images, audio if audio is not None else empty_audio, video)
+            return (images, audio if audio is not None else empty_audio, filenames)
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
             self.execute(
                 images,
                 audio,
-                video,
+                filenames,
                 load_balance,
                 multi_job_id,
                 is_worker,
@@ -486,9 +486,9 @@ class DistributedCollectorNode:
 
         return combined
 
-    async def execute(self, images, audio, video, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+    async def execute(self, images, audio, filenames, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
-            if video is not None:
+            if filenames is not None:
                 # The encoded file supersedes the frames: sending both would ship the same
                 # pixels twice, once compressed and once as raw PNG, which is the cost this
                 # path exists to avoid.
@@ -496,13 +496,13 @@ class DistributedCollectorNode:
                     f"Worker - Job {multi_job_id} complete. Sending one video file to master"
                     + (" (frames present but not sent)" if images is not None else "")
                 )
-                await self.send_video_to_master(video, multi_job_id, master_url, worker_id)
+                await self.send_video_to_master(filenames, multi_job_id, master_url, worker_id)
             else:
                 # Worker mode: send images and audio to master in a single batch
                 image_count = 0 if images is None else images.shape[0]
                 debug_log(f"Worker - Job {multi_job_id} complete. Sending {image_count} image(s) to master")
                 await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
-            return (images, audio if audio is not None else self.EMPTY_AUDIO, video)
+            return (images, audio if audio is not None else self.EMPTY_AUDIO, filenames)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
             # Master mode: collect images and audio from workers
@@ -518,7 +518,7 @@ class DistributedCollectorNode:
             expected_workers = set(enabled_workers)
             num_workers = len(expected_workers)
             if num_workers == 0:
-                return (images, audio if audio is not None else self.EMPTY_AUDIO, video)
+                return (images, audio if audio is not None else self.EMPTY_AUDIO, filenames)
 
             # Create the queue before any expensive local work to avoid job_complete race.
             async with prompt_server.distributed_jobs_lock:
@@ -544,7 +544,7 @@ class DistributedCollectorNode:
                 master_audio = audio  # Keep master's audio for later
                 debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
 
-            master_video = None if delegate_mode else video
+            master_video = None if delegate_mode else filenames
 
             # Initialize storage for collected images and audio
             worker_images = {}  # Dict to store images by worker_id and index

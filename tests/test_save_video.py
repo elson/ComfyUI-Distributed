@@ -81,7 +81,7 @@ class SaveVideoTests(unittest.TestCase):
 
     def test_it_takes_and_returns_vhs_filenames_so_it_can_chain(self):
         node = self.module.DistributedSaveVideo
-        self.assertEqual(node.INPUT_TYPES()["required"]["video"][0], "VHS_FILENAMES")
+        self.assertEqual(node.INPUT_TYPES()["required"]["filenames"][0], "VHS_FILENAMES")
         self.assertEqual(node.RETURN_TYPES, ("VHS_FILENAMES",))
 
     # -- saving ----------------------------------------------------------------

@@ -69,28 +69,30 @@ def _write_clip(tmp_path, name="clip_00001.mp4", body=b"not really an mp4"):
 def test_collector_exposes_video_as_optional_input():
     module = _load_collector_module()
     input_types = module.DistributedCollectorNode.INPUT_TYPES()
-    assert "video" not in input_types["required"]
-    assert input_types["optional"]["video"][0] == "VHS_FILENAMES"
+    assert "filenames" not in input_types["required"]
+    assert input_types["optional"]["filenames"][0] == "VHS_FILENAMES"
 
 
 def test_collector_returns_video_as_a_third_output():
     module = _load_collector_module()
     node = module.DistributedCollectorNode
     assert node.RETURN_TYPES == ("IMAGE", "AUDIO", "VHS_FILENAMES")
-    assert node.RETURN_NAMES == ("images", "audio", "video")
+    assert node.RETURN_NAMES == ("images", "audio", "filenames")
 
 
 def test_collector_rejects_a_run_with_no_media_at_all():
     collector = _load_collector_module().DistributedCollectorNode()
     with pytest.raises(ValueError, match="image, audio, or video"):
-        collector.run(images=None, audio=None, video=None)
+        collector.run(images=None, audio=None, filenames=None)
 
 
 def test_pass_through_returns_the_video_unchanged():
     collector = _load_collector_module().DistributedCollectorNode()
-    filenames = (True, ["/out/clip_00001.mp4"])
+    clip_filenames = (True, ["/out/clip_00001.mp4"])
 
-    images, audio, video = collector.run(images=None, video=[filenames], multi_job_id=[""])
+    images, audio, video = collector.run(
+        images=None, filenames=[clip_filenames], multi_job_id=[""]
+    )
 
     assert images is None
     assert video == (True, ["/out/clip_00001.mp4"])
@@ -110,7 +112,7 @@ def test_the_last_filename_is_the_one_sent():
 def test_empty_filenames_is_an_error_not_a_silent_skip():
     """(save_output, []) happens for a zero-frame batch and mid-Meta Batch."""
     collector = _load_collector_module().DistributedCollectorNode()
-    with pytest.raises(ValueError, match="empty video input"):
+    with pytest.raises(ValueError, match="empty filenames input"):
         collector._video_path_from_filenames((True, []))
 
 
@@ -170,7 +172,7 @@ def test_worker_does_not_also_send_frames_when_a_video_is_present(tmp_path):
         collector.execute(
             images=torch.zeros(4, 2, 2, 3),
             audio=None,
-            video=(False, [path]),
+            filenames=(False, [path]),
             multi_job_id="vid-job",
             is_worker=True,
             master_url="http://master",
@@ -282,7 +284,7 @@ def test_master_returns_a_collected_video_as_the_third_output():
         collector.execute(
             images=None,
             audio=None,
-            video=None,
+            filenames=None,
             multi_job_id="vid-job",
             enabled_worker_ids='["worker-a"]',
             delegate_only=True,
@@ -327,7 +329,7 @@ def test_a_video_item_does_not_disturb_image_assembly():
         collector.execute(
             images=None,
             audio=None,
-            video=None,
+            filenames=None,
             multi_job_id="mixed-job",
             enabled_worker_ids='["worker-a"]',
             delegate_only=True,
