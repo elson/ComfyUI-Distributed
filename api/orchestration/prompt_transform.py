@@ -365,8 +365,8 @@ def prune_prompt_for_worker(prompt_obj):
             )
             video_connected = (
                 class_type == "DistributedCollector"
-                and isinstance(inputs.get("video"), list)
-                and len(inputs["video"]) == 2
+                and isinstance(inputs.get("filenames"), list)
+                and len(inputs["filenames"]) == 2
             )
 
             if image_connected:
