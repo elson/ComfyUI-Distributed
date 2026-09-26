@@ -201,6 +201,7 @@ the clip in memory.
 | `basename` | text | no | suggested filename; sanitised to a bare basename with a video extension, and ignored otherwise |
 | `md5` | text | no | verified against the received bytes; a mismatch is a 400 and the partial file is discarded |
 | `is_last` | text | no | always treated as true - one file completes the worker |
+| `audio` | text | no | the canonical audio payload as JSON, when audio is wired into the collector rather than into Video Combine. Rides along here so one request still completes the worker |
 | `video` | file | yes | the encoded clip |
 
 ### Response
@@ -220,12 +221,12 @@ is what moves it into the output directory, under a `filename_prefix` the workfl
 clip that nothing saves is cleaned up with the rest of the temp directory.
 
 It lands on a `.part` first and is moved into place only once the whole body has arrived and
-the md5 matches, so a truncated transfer is never mistaken for a complete one.
+the md5 matches, so a truncated transfer is never mistaken for a complete one. Transfer progress is reported every few MiB under the node's debug logging, which is the only progress signal a single large transfer has - the per-frame path had one request per frame to count.
 
 ### Errors
 
-- `400` - not multipart, missing `job_id`/`worker_id`, no file part, or md5 mismatch
-- `404` - no collector is waiting on that `job_id`. The received file is kept.
+- `400` - not multipart, missing `job_id`/`worker_id`, no file part, md5 mismatch, or unparseable `audio`
+- `404` - no collector is waiting on that `job_id`. The received file is kept, and its path is logged under debug logging so it can be found.
 - `413` - `Content-Length` above `COMFYUI_MAX_VIDEO_PAYLOAD_BYTES` (default 8 GiB)
 
 ---

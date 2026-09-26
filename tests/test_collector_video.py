@@ -141,7 +141,7 @@ def test_worker_sends_one_multipart_request_with_the_file(tmp_path):
 
     asyncio.run(
         collector.send_video_to_master(
-            (False, [path]), "vid-job", "http://master", "worker-a"
+            (False, [path]), None, "vid-job", "http://master", "worker-a"
         )
     )
 
@@ -192,6 +192,7 @@ def test_a_missing_file_fails_before_any_request(tmp_path):
         asyncio.run(
             collector.send_video_to_master(
                 (False, [str(tmp_path / "gone.mp4")]),
+                None,
                 "vid-job",
                 "http://master",
                 "worker-a",
@@ -209,7 +210,7 @@ def test_send_is_retried_because_it_carries_the_whole_job(tmp_path, monkeypatch)
 
     asyncio.run(
         collector.send_video_to_master(
-            (False, [path]), "vid-job", "http://master", "worker-a"
+            (False, [path]), None, "vid-job", "http://master", "worker-a"
         )
     )
 
@@ -226,7 +227,7 @@ def test_send_gives_up_after_the_attempt_limit(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(
             collector.send_video_to_master(
-                (False, [path]), "vid-job", "http://master", "worker-a"
+                (False, [path]), None, "vid-job", "http://master", "worker-a"
             )
         )
 
