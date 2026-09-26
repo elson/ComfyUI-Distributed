@@ -1,5 +1,6 @@
 import json
 import asyncio
+import hashlib
 import io
 import os
 import base64
@@ -28,6 +29,9 @@ prompt_server = server.PromptServer.instance
 
 # Canonical worker result envelope accepted by POST /distributed/job_complete:
 # { "job_id": str, "worker_id": str, "batch_idx": int, "image": <base64 PNG>, "is_last": bool }
+#
+# A finished video arrives on POST /distributed/job_complete_video instead, as multipart, so
+# that neither end has to hold the clip in memory.
 
 
 def _decode_image_sync(image_path):
@@ -268,6 +272,181 @@ async def check_file_endpoint(request):
         
     except Exception as e:
         return await handle_api_error(request, e, 500)
+
+
+VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+
+# A finished clip is orders of magnitude larger than a tile, so the tile cap would reject
+# every real video. This is a guard against a runaway body, not a buffer size - the handler
+# streams to disk either way.
+MAX_VIDEO_PAYLOAD_SIZE = int(
+    os.environ.get('COMFYUI_MAX_VIDEO_PAYLOAD_BYTES', str(8 * 1024 * 1024 * 1024))
+)
+VIDEO_CHUNK_SIZE = 64 * 1024
+
+
+def _safe_video_filename(basename, job_id, worker_id):
+    """Turn a worker-supplied name into one that is safe to create in the output dir.
+
+    The name arrives from another machine and is used to create a file in a directory that
+    is frequently a network share, so none of it is trusted: the path is reduced to a bare
+    basename and the extension has to be one of the container formats Video Combine can
+    actually produce.
+    """
+    candidate = os.path.basename(str(basename or '').replace('\\', '/').strip())
+    if candidate in ('', '.', '..') or '/' in candidate:
+        candidate = ''
+    extension = os.path.splitext(candidate)[1].lower()
+    if not candidate or extension not in VIDEO_EXTENSIONS:
+        candidate = f"distributed_{job_id}_{worker_id}.mp4"
+        candidate = os.path.basename(candidate.replace('/', '_').replace('\\', '_'))
+    return candidate
+
+
+def _unique_output_path(output_dir, filename):
+    """Pick a path in output_dir that does not exist yet, suffixing _1, _2, ... if needed."""
+    stem, extension = os.path.splitext(filename)
+    path = os.path.join(output_dir, filename)
+    counter = 1
+    while os.path.exists(path):
+        path = os.path.join(output_dir, f"{stem}_{counter}{extension}")
+        counter += 1
+    return path
+
+
+@server.PromptServer.instance.routes.post("/distributed/job_complete_video")
+async def job_complete_video_endpoint(request):
+    """Receive one finished video file from a worker and write it to the output dir.
+
+    Multipart rather than a base64 JSON envelope, and streamed in chunks, so the master
+    never holds the clip in memory. That matters most on a delegate-only master, which is
+    typically the machine without the GPU and without the RAM headroom.
+
+    The file is written to a .part and moved into place only once the whole body has
+    arrived and its md5 matches, so a truncated transfer can never be mistaken for a
+    finished render by anything that later scans the output dir.
+    """
+    import folder_paths
+
+    temp_path = None
+    try:
+        content_length = request.headers.get('content-length')
+        if content_length and int(content_length) > MAX_VIDEO_PAYLOAD_SIZE:
+            return await handle_api_error(
+                request, f"Video payload too large: {content_length} bytes", 413
+            )
+
+        if not request.content_type or 'multipart/' not in request.content_type:
+            return await handle_api_error(
+                request, "Expected a multipart/form-data body", 400
+            )
+
+        fields = {}
+        received_bytes = 0
+        digest = hashlib.md5()
+        video_filename = None
+
+        reader = await request.multipart()
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == 'video':
+                job_id = str(fields.get('job_id', '')).strip()
+                worker_id = str(fields.get('worker_id', '')).strip()
+                if not job_id or not worker_id:
+                    return await handle_api_error(
+                        request,
+                        "job_id and worker_id must precede the video part",
+                        400,
+                    )
+                output_dir = folder_paths.get_output_directory()
+                os.makedirs(output_dir, exist_ok=True)
+                video_filename = _safe_video_filename(
+                    fields.get('basename') or part.filename, job_id, worker_id
+                )
+                final_path = _unique_output_path(output_dir, video_filename)
+                temp_path = f"{final_path}.part"
+                with open(temp_path, 'wb') as handle:
+                    while True:
+                        chunk = await part.read_chunk(VIDEO_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        received_bytes += len(chunk)
+                        if received_bytes > MAX_VIDEO_PAYLOAD_SIZE:
+                            raise ValueError(
+                                f"Video payload exceeded {MAX_VIDEO_PAYLOAD_SIZE} bytes"
+                            )
+                        digest.update(chunk)
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            else:
+                fields[part.name] = (await part.read(decode=True)).decode('utf-8')
+
+        errors = []
+        job_id = str(fields.get('job_id', '')).strip()
+        worker_id = str(fields.get('worker_id', '')).strip()
+        if not job_id:
+            errors.append("job_id: expected non-empty string")
+        if not worker_id:
+            errors.append("worker_id: expected non-empty string")
+        if temp_path is None or received_bytes == 0:
+            errors.append("video: expected a non-empty file part")
+        expected_md5 = fields.get('md5')
+        if expected_md5 and expected_md5 != digest.hexdigest():
+            errors.append(
+                f"video: md5 mismatch (expected {expected_md5}, got {digest.hexdigest()})"
+            )
+        if errors:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            return await handle_api_error(request, errors, 400)
+
+        final_path = temp_path[: -len('.part')]
+        os.replace(temp_path, final_path)
+        temp_path = None
+
+        pending = None
+        queue_size = 0
+        deadline = time.monotonic() + float(JOB_INIT_GRACE_PERIOD)
+        while pending is None:
+            async with prompt_server.distributed_jobs_lock:
+                pending = prompt_server.distributed_pending_jobs.get(job_id)
+                if pending is not None:
+                    await pending.put(
+                        {
+                            "tensor": None,
+                            "worker_id": worker_id,
+                            "image_index": None,
+                            "is_last": True,
+                            "audio": None,
+                            "video_path": final_path,
+                        }
+                    )
+                    queue_size = pending.qsize()
+                    break
+
+            if time.monotonic() > deadline:
+                return await handle_api_error(request, "job not initialized", 404)
+            await asyncio.sleep(0.05)
+
+        debug_log(
+            f"job_complete_video received file - job_id: {job_id}, worker: {worker_id}, "
+            f"bytes: {received_bytes}, path: {final_path}, queue_size: {queue_size}"
+        )
+
+        return web.json_response(
+            {"status": "success", "path": final_path, "bytes": received_bytes}
+        )
+    except ValueError as exc:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        return await handle_api_error(request, exc, 400)
+    except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        return await handle_api_error(request, e)
 
 
 @server.PromptServer.instance.routes.post("/distributed/job_complete")

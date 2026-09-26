@@ -178,6 +178,53 @@ If you call the API from a browser (not from a backend), ensure the master Comfy
 
 ---
 
+## Endpoint: `POST /distributed/job_complete_video`
+
+Submit one finished video file back to the master collector queue, instead of the frames it
+was made from. Used when a `Video Combine` is connected to the collector's `video` input: the
+worker encodes the clip and sends only the file, which for a long sequence is orders of
+magnitude less data than one base64 PNG per frame.
+
+### URL
+
+- `http://<master-host>:<master-port>/distributed/job_complete_video`
+
+### Request Body
+
+`multipart/form-data`, not JSON. The file is streamed in both directions, so neither end holds
+the clip in memory.
+
+| field | type | required | notes |
+| --- | --- | --- | --- |
+| `job_id` | text | yes | must appear **before** the `video` part |
+| `worker_id` | text | yes | must appear **before** the `video` part |
+| `basename` | text | no | suggested filename; sanitised to a bare basename with a video extension, and ignored otherwise |
+| `md5` | text | no | verified against the received bytes; a mismatch is a 400 and the partial file is discarded |
+| `is_last` | text | no | always treated as true - one file completes the worker |
+| `video` | file | yes | the encoded clip |
+
+### Response
+
+```json
+{
+  "status": "success",
+  "path": "/path/to/ComfyUI/output/clip_00001.mp4",
+  "bytes": 12345678
+}
+```
+
+The file is written into the master's output directory. It lands on a `.part` first and is
+moved into place only once the whole body has arrived and the md5 matches, so a truncated
+transfer is never mistaken for a finished render.
+
+### Errors
+
+- `400` - not multipart, missing `job_id`/`worker_id`, no file part, or md5 mismatch
+- `404` - no collector is waiting on that `job_id`. The received file is kept.
+- `413` - `Content-Length` above `COMFYUI_MAX_VIDEO_PAYLOAD_BYTES` (default 8 GiB)
+
+---
+
 ## Log Endpoints
 
 ### `GET /distributed/worker_log/{worker_id}`
