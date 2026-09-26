@@ -173,7 +173,11 @@ class DistributedSaveVideo:
             folder_paths.get_save_image_path(filename_prefix, output_dir)
         )
         extension = os.path.splitext(source)[1] or ".mp4"
-        name = f"{filename}_{counter:05}_{extension}"
+        # No trailing underscore before the extension. Core's SaveImage and SaveVideo both
+        # emit one (ComfyUI_00001_.png), but Video Combine does not, and a clip collected
+        # from Video Combine belongs with its siblings. get_save_image_path's counter parser
+        # copes either way: it reads digits from base_remainder.split('_')[0].
+        name = f"{filename}_{counter:05}{extension}"
         return os.path.join(full_output_folder, name), subfolder, name
 
     @staticmethod

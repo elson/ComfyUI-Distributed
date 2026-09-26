@@ -76,8 +76,8 @@ def test_collector_exposes_video_as_optional_input():
 def test_collector_returns_video_as_a_third_output():
     module = _load_collector_module()
     node = module.DistributedCollectorNode
-    assert node.RETURN_TYPES == ("IMAGE", "AUDIO", "VHS_FILENAMES")
-    assert node.RETURN_NAMES == ("images", "audio", "filenames")
+    assert node.RETURN_TYPES == ("IMAGE", "AUDIO", "VHS_FILENAMES", "VIDEO")
+    assert node.RETURN_NAMES == ("images", "audio", "filenames", "video")
 
 
 def test_collector_rejects_a_run_with_no_media_at_all():
@@ -90,12 +90,12 @@ def test_pass_through_returns_the_video_unchanged():
     collector = _load_collector_module().DistributedCollectorNode()
     clip_filenames = (True, ["/out/clip_00001.mp4"])
 
-    images, audio, video = collector.run(
+    images, audio, filenames, video = collector.run(
         images=None, filenames=[clip_filenames], multi_job_id=[""]
     )
 
     assert images is None
-    assert video == (True, ["/out/clip_00001.mp4"])
+    assert filenames == (True, ["/out/clip_00001.mp4"])
 
 
 # ---------------------------------------------------------------------------

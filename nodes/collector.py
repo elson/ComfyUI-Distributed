@@ -20,6 +20,11 @@ from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.audio_payload import encode_audio_payload
 from ..utils.async_helpers import run_async_in_server_loop
 
+try:
+    from comfy_api.latest import InputImpl as _InputImpl
+except ImportError:  # ComfyUI predating comfy_api's video types
+    _InputImpl = None
+
 prompt_server = _server.PromptServer.instance
 
 # One request carries the whole job's output, so it is worth retrying, and it can be large
@@ -68,8 +73,8 @@ class DistributedCollectorNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "VHS_FILENAMES")
-    RETURN_NAMES = ("images", "audio", "filenames")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "VHS_FILENAMES", "VIDEO")
+    RETURN_NAMES = ("images", "audio", "filenames", "video")
     FUNCTION = "run"
     CATEGORY = "image"
     
@@ -185,7 +190,9 @@ class DistributedCollectorNode:
         if not multi_job_id or pass_through:
             if pass_through:
                 debug_log("Collector: pass-through mode enabled, returning images unchanged")
-            return (images, audio if audio is not None else empty_audio, filenames)
+            return self._with_video_object(
+                (images, audio if audio is not None else empty_audio, filenames)
+            )
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
@@ -203,7 +210,43 @@ class DistributedCollectorNode:
                 delegate_only,
             )
         )
-        return result
+        return self._with_video_object(result)
+
+    def _with_video_object(self, result):
+        """Append a core VIDEO alongside the VHS_FILENAMES output.
+
+        Costs nothing: VideoFromFile only stores the path, so this is a handle, not a
+        decode. What it buys is the whole core video ecosystem on the master - in
+        particular core's SaveVideo, which remuxes rather than re-encodes when the
+        container and codec already match, and which writes the workflow into the
+        container metadata. That is the sidecar metadata PNG problem solved without a
+        sidecar.
+
+        Several collected clips become a VideoFromList, which core concatenates on save.
+        The filenames output still lists them individually, so both readings stay
+        available: one clip per worker, or the lot as a single video.
+
+        Only run() appends this, not execute(), so the internal collection paths keep
+        returning the three-tuple they build.
+        """
+        filenames = result[2] if len(result) > 2 else None
+        return tuple(result) + (self._video_object(filenames),)
+
+    @staticmethod
+    def _video_object(filenames):
+        paths = list(filenames[1]) if filenames and filenames[1] else []
+        if not paths:
+            return None
+        if _InputImpl is None:
+            log(
+                "[Distributed] Collector - this ComfyUI has no comfy_api video types, so the "
+                "video output is empty; use the filenames output instead"
+            )
+            return None
+        videos = [_InputImpl.VideoFromFile(path) for path in paths]
+        if len(videos) == 1:
+            return videos[0]
+        return _InputImpl.VideoFromList(videos)
 
     async def send_video_to_master(self, video, multi_job_id, master_url, worker_id):
         """Stream one finished video file to the master as multipart.
