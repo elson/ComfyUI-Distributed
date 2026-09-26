@@ -91,7 +91,10 @@ def _load_job_routes_module(output_dir):
     sys.modules["server"] = server_module
 
     folder_paths_module = types.ModuleType("folder_paths")
+    # The route stages received clips in the temp dir; DistributedSaveVideo is what moves
+    # them to output. Both point at the same tmp dir here so the assertions stay simple.
     folder_paths_module.get_output_directory = lambda: str(output_dir)
+    folder_paths_module.get_temp_directory = lambda: str(output_dir)
     folder_paths_module.get_annotated_filepath = lambda name: str(Path(output_dir) / name)
     sys.modules["folder_paths"] = folder_paths_module
 
@@ -155,7 +158,7 @@ def _video_parts(body, job_id="vid-job", worker_id="worker-a", basename="clip_00
 
 
 class SafeFilenameTests(unittest.TestCase):
-    """The name comes off the wire, so it must not be able to escape the output dir."""
+    """The name comes off the wire, so it must not be able to escape the directory."""
 
     def setUp(self):
         self.module = _load_job_routes_module("/tmp")
@@ -215,7 +218,7 @@ class JobCompleteVideoEndpointTests(unittest.TestCase):
         response = asyncio.run(self.module.job_complete_video_endpoint(request))
         return response, queue
 
-    def test_streams_file_to_output_dir_and_queues_the_path(self):
+    def test_streams_file_to_the_staging_dir_and_queues_the_path(self):
         body = os.urandom(200_000)
         response, queue = self._run(_FakeRequest(_video_parts(body, chunk_size=4096)))
 

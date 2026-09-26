@@ -1,0 +1,201 @@
+"""DistributedSaveVideo: the video counterpart of SaveImage.
+
+A collected clip is staged in the temp dir by the job_complete_video route and is not
+saved until this node moves it, the same way a collected IMAGE is not written until a
+SaveImage node writes it. Nothing here decodes or re-encodes.
+"""
+
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+
+def _load_save_video_module(root):
+    """Load nodes/save_video.py with folder_paths pointed at a real directory tree."""
+    module_path = Path(__file__).resolve().parents[1] / "nodes" / "save_video.py"
+    package_name = "dist_save_video_testpkg"
+
+    for mod_name in list(sys.modules):
+        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
+            del sys.modules[mod_name]
+
+    for suffix in ("", ".nodes", ".utils"):
+        pkg = types.ModuleType(f"{package_name}{suffix}")
+        pkg.__path__ = []
+        sys.modules[f"{package_name}{suffix}"] = pkg
+
+    for name in ("output", "temp", "input"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+
+    folder_paths_module = types.ModuleType("folder_paths")
+    folder_paths_module.get_output_directory = lambda: str(root / "output")
+    folder_paths_module.get_temp_directory = lambda: str(root / "temp")
+    folder_paths_module.get_input_directory = lambda: str(root / "input")
+
+    def get_save_image_path(filename_prefix, output_dir, *_args):
+        prefix_path = Path(filename_prefix)
+        subfolder = str(prefix_path.parent) if str(prefix_path.parent) != "." else ""
+        full_output_folder = Path(output_dir) / subfolder
+        full_output_folder.mkdir(parents=True, exist_ok=True)
+        counter = 1 + len(list(full_output_folder.glob(f"{prefix_path.name}_*")))
+        return str(full_output_folder), prefix_path.name, counter, subfolder, filename_prefix
+
+    folder_paths_module.get_save_image_path = get_save_image_path
+    sys.modules["folder_paths"] = folder_paths_module
+
+    logging_module = types.ModuleType(f"{package_name}.utils.logging")
+    logging_module.debug_log = lambda *_a, **_k: None
+    logging_module.log = lambda *_a, **_k: None
+    sys.modules[f"{package_name}.utils.logging"] = logging_module
+
+    spec = importlib.util.spec_from_file_location(f"{package_name}.nodes.save_video", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class SaveVideoTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.module = _load_save_video_module(self.root)
+        self.node = self.module.DistributedSaveVideo()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _staged(self, name="clip_00001.mp4", body=b"not really an mp4"):
+        path = self.root / "temp" / name
+        path.write_bytes(body)
+        return path
+
+    # -- node shape ------------------------------------------------------------
+
+    def test_it_is_an_output_node_so_it_can_terminate_the_graph(self):
+        self.assertTrue(self.module.DistributedSaveVideo.OUTPUT_NODE)
+
+    def test_it_takes_and_returns_vhs_filenames_so_it_can_chain(self):
+        node = self.module.DistributedSaveVideo
+        self.assertEqual(node.INPUT_TYPES()["required"]["video"][0], "VHS_FILENAMES")
+        self.assertEqual(node.RETURN_TYPES, ("VHS_FILENAMES",))
+
+    # -- saving ----------------------------------------------------------------
+
+    def test_it_moves_the_staged_file_into_output(self):
+        staged = self._staged(body=b"payload")
+        result = self.node.save((True, [str(staged)]), "video/ComfyUI")
+
+        saved = self.root / "output" / "video" / "ComfyUI_00001_.mp4"
+        self.assertTrue(saved.exists(), list((self.root / "output").rglob("*")))
+        self.assertEqual(saved.read_bytes(), b"payload")
+        self.assertFalse(staged.exists(), "the staged copy should not be left behind")
+        self.assertEqual(result["result"][0], (True, [str(saved)]))
+
+    def test_the_source_extension_is_preserved(self):
+        staged = self._staged(name="clip.webm")
+        self.node.save((True, [str(staged)]), "video/ComfyUI")
+        self.assertTrue((self.root / "output" / "video" / "ComfyUI_00001_.webm").exists())
+
+    def test_filename_prefix_controls_the_subfolder(self):
+        staged = self._staged()
+        self.node.save((True, [str(staged)]), "WAN/2026-09/clip")
+        self.assertTrue((self.root / "output" / "WAN" / "2026-09" / "clip_00001_.mp4").exists())
+
+    def test_repeated_saves_do_not_overwrite(self):
+        first = self._staged(name="a.mp4", body=b"a")
+        self.node.save((True, [str(first)]), "video/ComfyUI")
+        second = self._staged(name="b.mp4", body=b"b")
+        self.node.save((True, [str(second)]), "video/ComfyUI")
+
+        folder = self.root / "output" / "video"
+        self.assertEqual(
+            sorted(p.name for p in folder.iterdir()),
+            ["ComfyUI_00001_.mp4", "ComfyUI_00002_.mp4"],
+        )
+
+    def test_every_file_is_saved_for_a_multi_worker_collection(self):
+        first = self._staged(name="a.mp4", body=b"a")
+        second = self._staged(name="b.mp4", body=b"b")
+        result = self.node.save((True, [str(first), str(second)]), "video/ComfyUI")
+
+        self.assertEqual(len(result["result"][0][1]), 2)
+        self.assertEqual(len(result["ui"]["images"]), 2)
+
+    # -- preview ---------------------------------------------------------------
+
+    def test_it_reports_the_file_in_core_s_video_shape(self):
+        """That shape is what draws an inline player and registers the asset."""
+        staged = self._staged()
+        result = self.node.save((True, [str(staged)]), "video/ComfyUI")
+
+        self.assertEqual(result["ui"]["animated"], (True,))
+        entry = result["ui"]["images"][0]
+        self.assertEqual(entry["filename"], "ComfyUI_00001_.mp4")
+        self.assertEqual(entry["subfolder"], "video")
+        self.assertEqual(entry["type"], "output")
+        self.assertEqual(entry["format"], "video/mp4")
+
+    def test_it_does_not_use_the_vhs_gifs_key(self):
+        """Emitting both would register the same file as an asset twice."""
+        staged = self._staged()
+        result = self.node.save((True, [str(staged)]), "video/ComfyUI")
+        self.assertNotIn("gifs", result["ui"])
+
+    def test_save_output_off_previews_without_moving_the_file(self):
+        staged = self._staged()
+        result = self.node.save((True, [str(staged)]), "video/ComfyUI", save_output=False)
+
+        self.assertTrue(staged.exists(), "the file should stay staged")
+        self.assertEqual(list((self.root / "output").rglob("*.mp4")), [])
+        entry = result["ui"]["images"][0]
+        self.assertEqual(entry["type"], "temp")
+        self.assertEqual(entry["filename"], "clip_00001.mp4")
+        self.assertEqual(result["result"][0], (False, [str(staged)]))
+
+    # -- edge cases ------------------------------------------------------------
+
+    def test_an_empty_video_input_is_not_an_error(self):
+        """Video Combine returns (save_output, []) for a zero-frame or unfinished batch."""
+        result = self.node.save((True, []), "video/ComfyUI")
+        self.assertEqual(result["result"][0], (True, []))
+        self.assertEqual(result["ui"]["images"], [])
+
+    def test_a_missing_file_raises_rather_than_silently_saving_nothing(self):
+        with self.assertRaises(ValueError):
+            self.node.save((True, [str(self.root / "temp" / "gone.mp4")]), "video/ComfyUI")
+
+    def test_a_malformed_video_input_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.node.save("not-a-filenames-pair", "video/ComfyUI")
+
+    def test_the_comfyui_list_wrapper_is_tolerated(self):
+        staged = self._staged()
+        result = self.node.save([(True, [str(staged)])], "video/ComfyUI")
+        self.assertEqual(len(result["result"][0][1]), 1)
+
+    def test_a_copy_is_used_when_the_move_fails(self):
+        """output is frequently a network share, so os.replace can fail with EXDEV."""
+        staged = self._staged(body=b"payload")
+        original_replace = self.module.os.replace
+
+        def failing_replace(src, dst):
+            raise OSError(18, "Invalid cross-device link")
+
+        self.module.os.replace = failing_replace
+        try:
+            self.node.save((True, [str(staged)]), "video/ComfyUI")
+        finally:
+            self.module.os.replace = original_replace
+
+        saved = self.root / "output" / "video" / "ComfyUI_00001_.mp4"
+        self.assertEqual(saved.read_bytes(), b"payload")
+        self.assertFalse(staged.exists(), "the staged copy should be removed after copying")
+
+
+if __name__ == "__main__":
+    unittest.main()

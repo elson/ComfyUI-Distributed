@@ -213,9 +213,14 @@ the clip in memory.
 }
 ```
 
-The file is written into the master's output directory. It lands on a `.part` first and is
-moved into place only once the whole body has arrived and the md5 matches, so a truncated
-transfer is never mistaken for a finished render.
+The file is staged in the master's **temp** directory, not the output directory. Receiving a
+clip is not the same as saving it: a collected IMAGE is not written anywhere until a
+`SaveImage` node saves it, and a collected video behaves the same way - `DistributedSaveVideo`
+is what moves it into the output directory, under a `filename_prefix` the workflow chooses. A
+clip that nothing saves is cleaned up with the rest of the temp directory.
+
+It lands on a `.part` first and is moved into place only once the whole body has arrived and
+the md5 matches, so a truncated transfer is never mistaken for a complete one.
 
 ### Errors
 
