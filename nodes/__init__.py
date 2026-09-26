@@ -10,9 +10,11 @@ from .utilities import (
     any_type,
 )
 from .collector import DistributedCollectorNode
+from .save_video import DistributedSaveVideo
 
 NODE_CLASS_MAPPINGS = {
     "DistributedCollector": DistributedCollectorNode,
+    "DistributedSaveVideo": DistributedSaveVideo,
     "DistributedSeed": DistributedSeed,
     "DistributedModelName": DistributedModelName,
     "DistributedValue": DistributedValue,
@@ -22,6 +24,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DistributedCollector": "Distributed Collector",
+    "DistributedSaveVideo": "Distributed Save Video",
     "DistributedSeed": "Distributed Seed",
     "DistributedModelName": "Distributed Model Name",
     "DistributedValue": "Distributed Value",

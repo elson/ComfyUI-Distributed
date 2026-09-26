@@ -286,12 +286,11 @@ VIDEO_CHUNK_SIZE = 64 * 1024
 
 
 def _safe_video_filename(basename, job_id, worker_id):
-    """Turn a worker-supplied name into one that is safe to create in the output dir.
+    """Turn a worker-supplied name into one that is safe to create locally.
 
-    The name arrives from another machine and is used to create a file in a directory that
-    is frequently a network share, so none of it is trusted: the path is reduced to a bare
-    basename and the extension has to be one of the container formats Video Combine can
-    actually produce.
+    The name arrives from another machine and is used to create a file on this one, so none
+    of it is trusted: the path is reduced to a bare basename and the extension has to be one
+    of the container formats Video Combine can actually produce.
     """
     candidate = os.path.basename(str(basename or '').replace('\\', '/').strip())
     if candidate in ('', '.', '..') or '/' in candidate:
@@ -303,28 +302,35 @@ def _safe_video_filename(basename, job_id, worker_id):
     return candidate
 
 
-def _unique_output_path(output_dir, filename):
-    """Pick a path in output_dir that does not exist yet, suffixing _1, _2, ... if needed."""
+def _unique_output_path(directory, filename):
+    """Pick a path in directory that does not exist yet, suffixing _1, _2, ... if needed."""
     stem, extension = os.path.splitext(filename)
-    path = os.path.join(output_dir, filename)
+    path = os.path.join(directory, filename)
     counter = 1
     while os.path.exists(path):
-        path = os.path.join(output_dir, f"{stem}_{counter}{extension}")
+        path = os.path.join(directory, f"{stem}_{counter}{extension}")
         counter += 1
     return path
 
 
 @server.PromptServer.instance.routes.post("/distributed/job_complete_video")
 async def job_complete_video_endpoint(request):
-    """Receive one finished video file from a worker and write it to the output dir.
+    """Receive one finished video file from a worker and stage it in the temp dir.
 
     Multipart rather than a base64 JSON envelope, and streamed in chunks, so the master
     never holds the clip in memory. That matters most on a delegate-only master, which is
     typically the machine without the GPU and without the RAM headroom.
 
+    **Temp, not output, on purpose.** Receiving a file is not the same as saving it. A
+    collected IMAGE is not written anywhere until a SaveImage node says so, and a collected
+    video behaves the same way: it is staged here and DistributedSaveVideo moves it into the
+    output directory under a filename_prefix the user controls. Writing straight to output
+    would save every clip whether or not the graph asked for one, and would take the choice
+    of where it lands away from the workflow.
+
     The file is written to a .part and moved into place only once the whole body has
     arrived and its md5 matches, so a truncated transfer can never be mistaken for a
-    finished render by anything that later scans the output dir.
+    complete one by anything that later reads the staging directory.
     """
     import folder_paths
 
@@ -360,12 +366,12 @@ async def job_complete_video_endpoint(request):
                         "job_id and worker_id must precede the video part",
                         400,
                     )
-                output_dir = folder_paths.get_output_directory()
-                os.makedirs(output_dir, exist_ok=True)
+                staging_dir = folder_paths.get_temp_directory()
+                os.makedirs(staging_dir, exist_ok=True)
                 video_filename = _safe_video_filename(
                     fields.get('basename') or part.filename, job_id, worker_id
                 )
-                final_path = _unique_output_path(output_dir, video_filename)
+                final_path = _unique_output_path(staging_dir, video_filename)
                 temp_path = f"{final_path}.part"
                 with open(temp_path, 'wb') as handle:
                     while True:

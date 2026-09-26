@@ -39,6 +39,15 @@ def _load_collector_module():
         distributed_jobs_lock=None,
         distributed_pending_jobs={},
     )
+    # collector.py imports folder_paths lazily to locate a file within ComfyUI's
+    # directories. Point it at paths nothing in the tests lives under, so a clip written
+    # to tmp_path resolves as "outside ComfyUI" unless a test says otherwise.
+    folder_paths_module = types.ModuleType("folder_paths")
+    folder_paths_module.get_output_directory = lambda: "/nonexistent-comfy/output"
+    folder_paths_module.get_temp_directory = lambda: "/nonexistent-comfy/temp"
+    folder_paths_module.get_input_directory = lambda: "/nonexistent-comfy/input"
+    sys.modules["folder_paths"] = folder_paths_module
+
     server_module = types.ModuleType("server")
     server_module.PromptServer = types.SimpleNamespace(instance=prompt_server)
     sys.modules["server"] = server_module
