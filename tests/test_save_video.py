@@ -35,12 +35,32 @@ def _load_save_video_module(root):
     folder_paths_module.get_input_directory = lambda: str(root / "input")
 
     def get_save_image_path(filename_prefix, output_dir, *_args):
-        prefix_path = Path(filename_prefix)
-        subfolder = str(prefix_path.parent) if str(prefix_path.parent) != "." else ""
+        """Mirror folder_paths.get_save_image_path, including its counter parser.
+
+        The counter is derived the way core derives it - digits from
+        ``name[prefix_len + 1:].split('.')[0].split('_')[0]`` - rather than by counting
+        files, so these tests actually exercise whether a filename this node produces can
+        be parsed back into a counter. A glob-based stand-in would pass regardless, and the
+        naming scheme is exactly what could break incrementing.
+        """
+        import os as _os
+
+        subfolder = _os.path.dirname(_os.path.normpath(filename_prefix))
+        filename = _os.path.basename(_os.path.normpath(filename_prefix))
         full_output_folder = Path(output_dir) / subfolder
         full_output_folder.mkdir(parents=True, exist_ok=True)
-        counter = 1 + len(list(full_output_folder.glob(f"{prefix_path.name}_*")))
-        return str(full_output_folder), prefix_path.name, counter, subfolder, filename_prefix
+
+        digits = []
+        for existing in full_output_folder.iterdir():
+            if not existing.name.startswith(filename):
+                continue
+            try:
+                remainder = existing.name[len(filename) + 1:]
+                digits.append(int(remainder.split(".")[0].split("_")[0]))
+            except ValueError:
+                continue
+        counter = max(digits) + 1 if digits else 1
+        return str(full_output_folder), filename, counter, subfolder, filename_prefix
 
     folder_paths_module.get_save_image_path = get_save_image_path
     sys.modules["folder_paths"] = folder_paths_module
@@ -90,7 +110,7 @@ class SaveVideoTests(unittest.TestCase):
         staged = self._staged(body=b"payload")
         result = self.node.save((True, [str(staged)]), "video/ComfyUI")
 
-        saved = self.root / "output" / "video" / "ComfyUI_00001_.mp4"
+        saved = self.root / "output" / "video" / "ComfyUI_00001.mp4"
         self.assertTrue(saved.exists(), list((self.root / "output").rglob("*")))
         self.assertEqual(saved.read_bytes(), b"payload")
         self.assertFalse(staged.exists(), "the staged copy should not be left behind")
@@ -99,12 +119,12 @@ class SaveVideoTests(unittest.TestCase):
     def test_the_source_extension_is_preserved(self):
         staged = self._staged(name="clip.webm")
         self.node.save((True, [str(staged)]), "video/ComfyUI")
-        self.assertTrue((self.root / "output" / "video" / "ComfyUI_00001_.webm").exists())
+        self.assertTrue((self.root / "output" / "video" / "ComfyUI_00001.webm").exists())
 
     def test_filename_prefix_controls_the_subfolder(self):
         staged = self._staged()
         self.node.save((True, [str(staged)]), "WAN/2026-09/clip")
-        self.assertTrue((self.root / "output" / "WAN" / "2026-09" / "clip_00001_.mp4").exists())
+        self.assertTrue((self.root / "output" / "WAN" / "2026-09" / "clip_00001.mp4").exists())
 
     def test_repeated_saves_do_not_overwrite(self):
         first = self._staged(name="a.mp4", body=b"a")
@@ -115,8 +135,11 @@ class SaveVideoTests(unittest.TestCase):
         folder = self.root / "output" / "video"
         self.assertEqual(
             sorted(p.name for p in folder.iterdir()),
-            ["ComfyUI_00001_.mp4", "ComfyUI_00002_.mp4"],
+            ["ComfyUI_00001.mp4", "ComfyUI_00002.mp4"],
         )
+        # The counter advanced, so a name without the trailing underscore still parses.
+        self.assertEqual((folder / "ComfyUI_00001.mp4").read_bytes(), b"a")
+        self.assertEqual((folder / "ComfyUI_00002.mp4").read_bytes(), b"b")
 
     def test_every_file_is_saved_for_a_multi_worker_collection(self):
         first = self._staged(name="a.mp4", body=b"a")
@@ -135,7 +158,7 @@ class SaveVideoTests(unittest.TestCase):
 
         self.assertEqual(result["ui"]["animated"], (True,))
         entry = result["ui"]["images"][0]
-        self.assertEqual(entry["filename"], "ComfyUI_00001_.mp4")
+        self.assertEqual(entry["filename"], "ComfyUI_00001.mp4")
         self.assertEqual(entry["subfolder"], "video")
         self.assertEqual(entry["type"], "output")
         self.assertEqual(entry["format"], "video/mp4")
@@ -192,7 +215,7 @@ class SaveVideoTests(unittest.TestCase):
         finally:
             self.module.os.replace = original_replace
 
-        saved = self.root / "output" / "video" / "ComfyUI_00001_.mp4"
+        saved = self.root / "output" / "video" / "ComfyUI_00001.mp4"
         self.assertEqual(saved.read_bytes(), b"payload")
         self.assertFalse(staged.exists(), "the staged copy should be removed after copying")
 
