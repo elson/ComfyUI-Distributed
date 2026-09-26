@@ -222,9 +222,12 @@ class DistributedCollectorNode:
         container metadata. That is the sidecar metadata PNG problem solved without a
         sidecar.
 
-        Several collected clips become a VideoFromList, which core concatenates on save.
-        The filenames output still lists them individually, so both readings stay
-        available: one clip per worker, or the lot as a single video.
+        With several collected clips the handle carries only the first, and says so.
+        Nothing splits a video across workers - there is no frame-range divider, and
+        DistributedSeed gives each participant its own seed - so N workers produce N
+        variants of the same clip, not N segments of one. Concatenating them would be
+        joining unrelated takes end to end. The filenames output lists all of them, which
+        is the honest representation; pick one with Select Filename.
 
         Only run() appends this, not execute(), so the internal collection paths keep
         returning the three-tuple they build.
@@ -243,12 +246,16 @@ class DistributedCollectorNode:
                 "video output is empty; use the filenames output instead"
             )
             return None
-        videos = [_InputImpl.VideoFromFile(path) for path in paths]
-        if len(videos) == 1:
-            return videos[0]
-        return _InputImpl.VideoFromList(videos)
+        if len(paths) > 1:
+            log(
+                f"[Distributed] Collector - collected {len(paths)} separate clips; the video "
+                f"output carries only the first ({os.path.basename(paths[0])}). They are "
+                f"variants rather than segments, so they are not joined - use the filenames "
+                f"output and Select Filename to choose one."
+            )
+        return _InputImpl.VideoFromFile(paths[0])
 
-    async def send_video_to_master(self, video, multi_job_id, master_url, worker_id):
+    async def send_video_to_master(self, video, audio, multi_job_id, master_url, worker_id):
         """Stream one finished video file to the master as multipart.
 
         Deliberately not a JSON envelope. The whole point of collecting a video instead of
@@ -259,12 +266,18 @@ class DistributedCollectorNode:
 
         Retried, unlike the per-frame path: this single request carries the entire result
         of the job, so losing it to one transient error throws away all the GPU work.
+
+        Audio rides along as a form field rather than in a second request. Wiring audio into
+        Video Combine puts it inside the file, but wiring it into the collector means the
+        caller wants it on the master's audio output, and sending nothing there dropped it
+        silently. One request still completes the worker, so is_last stays unambiguous.
         """
         path = self._video_path_from_filenames(video)
         if not os.path.exists(path):
             raise ValueError(f"DistributedCollector video file does not exist: {path}")
 
         basename = os.path.basename(path)
+        encoded_audio = encode_audio_payload(audio)
         file_hash = await asyncio.to_thread(self._file_md5, path)
         size = os.path.getsize(path)
         session = await get_client_session()
@@ -284,6 +297,8 @@ class DistributedCollectorNode:
                     form.add_field("basename", basename)
                     form.add_field("md5", file_hash)
                     form.add_field("is_last", "true")
+                    if encoded_audio is not None:
+                        form.add_field("audio", json.dumps(encoded_audio))
                     form.add_field(
                         "video", handle, filename=basename, content_type="video/mp4"
                     )
@@ -528,8 +543,11 @@ class DistributedCollectorNode:
                 debug_log(
                     f"Worker - Job {multi_job_id} complete. Sending one video file to master"
                     + (" (frames present but not sent)" if images is not None else "")
+                    + (" with audio" if audio is not None else "")
                 )
-                await self.send_video_to_master(filenames, multi_job_id, master_url, worker_id)
+                await self.send_video_to_master(
+                    filenames, audio, multi_job_id, master_url, worker_id
+                )
             else:
                 # Worker mode: send images and audio to master in a single batch
                 image_count = 0 if images is None else images.shape[0]

@@ -283,6 +283,18 @@ MAX_VIDEO_PAYLOAD_SIZE = int(
     os.environ.get('COMFYUI_MAX_VIDEO_PAYLOAD_BYTES', str(8 * 1024 * 1024 * 1024))
 )
 VIDEO_CHUNK_SIZE = 64 * 1024
+# One POST replaces one-per-frame, so there is no per-frame progress to watch any more.
+# Report every few MiB under debug logging, which is the only progress signal a large
+# transfer has.
+VIDEO_PROGRESS_INTERVAL = 8 * 1024 * 1024
+
+
+def _format_progress(received, expected):
+    """Human-sized progress, with a percentage only when Content-Length gave us a total."""
+    mib = received / (1024 * 1024)
+    if expected:
+        return f"{mib:.1f} MiB of {expected / (1024 * 1024):.1f} MiB ({received * 100 // expected}%)"
+    return f"{mib:.1f} MiB"
 
 
 def _safe_video_filename(basename, job_id, worker_id):
@@ -373,6 +385,8 @@ async def job_complete_video_endpoint(request):
                 )
                 final_path = _unique_output_path(staging_dir, video_filename)
                 temp_path = f"{final_path}.part"
+                expected_bytes = int(content_length) if content_length else 0
+                next_progress = VIDEO_PROGRESS_INTERVAL
                 with open(temp_path, 'wb') as handle:
                     while True:
                         chunk = await part.read_chunk(VIDEO_CHUNK_SIZE)
@@ -385,8 +399,18 @@ async def job_complete_video_endpoint(request):
                             )
                         digest.update(chunk)
                         handle.write(chunk)
+                        if received_bytes >= next_progress:
+                            debug_log(
+                                f"job_complete_video receiving {video_filename} from "
+                                f"{worker_id}: {_format_progress(received_bytes, expected_bytes)}"
+                            )
+                            next_progress += VIDEO_PROGRESS_INTERVAL
                     handle.flush()
                     os.fsync(handle.fileno())
+                debug_log(
+                    f"job_complete_video received {video_filename} from {worker_id}: "
+                    f"{received_bytes} bytes complete"
+                )
             else:
                 fields[part.name] = (await part.read(decode=True)).decode('utf-8')
 
@@ -409,6 +433,17 @@ async def job_complete_video_endpoint(request):
                 os.remove(temp_path)
             return await handle_api_error(request, errors, 400)
 
+        try:
+            decoded_audio = (
+                _decode_audio_payload(json.loads(fields['audio']))
+                if fields.get('audio')
+                else None
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            return await handle_api_error(request, f"audio: {exc}", 400)
+
         final_path = temp_path[: -len('.part')]
         os.replace(temp_path, final_path)
         temp_path = None
@@ -426,7 +461,7 @@ async def job_complete_video_endpoint(request):
                             "worker_id": worker_id,
                             "image_index": None,
                             "is_last": True,
-                            "audio": None,
+                            "audio": decoded_audio,
                             "video_path": final_path,
                         }
                     )
@@ -434,12 +469,19 @@ async def job_complete_video_endpoint(request):
                     break
 
             if time.monotonic() > deadline:
+                # The file is deliberately kept - the GPU work is already done - so name it,
+                # or it is an orphan in the staging directory nobody can find.
+                debug_log(
+                    f"job_complete_video: no collector waiting on job {job_id}; the received "
+                    f"file is kept at {final_path}"
+                )
                 return await handle_api_error(request, "job not initialized", 404)
             await asyncio.sleep(0.05)
 
         debug_log(
-            f"job_complete_video received file - job_id: {job_id}, worker: {worker_id}, "
-            f"bytes: {received_bytes}, path: {final_path}, queue_size: {queue_size}"
+            f"job_complete_video staged file - job_id: {job_id}, worker: {worker_id}, "
+            f"bytes: {received_bytes}, audio: {decoded_audio is not None}, "
+            f"path: {final_path}, queue_size: {queue_size}"
         )
 
         return web.json_response(

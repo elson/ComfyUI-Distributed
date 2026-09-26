@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import importlib.util
 import os
 import sys
@@ -302,6 +303,134 @@ class JobCompleteVideoEndpointTests(unittest.TestCase):
         self.assertEqual(response.status, 404)
         # The bytes were already received; discarding them would lose the render.
         self.assertTrue((self.output_dir / "clip_00001.mp4").exists())
+
+
+class JobCompleteVideoAudioTests(unittest.TestCase):
+    """Audio arriving alongside the file must reach the collector's queue."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self._tmp.name)
+        self.module = _load_job_routes_module(self.output_dir)
+        self.decoded = []
+        self.module._decode_audio_payload = self._decode
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _decode(self, payload):
+        self.decoded.append(payload)
+        return {"waveform": "decoded", "sample_rate": payload.get("sr")}
+
+    def _run(self, request, job_id="vid-job"):
+        queue = asyncio.Queue()
+        self.module._prompt_server.distributed_pending_jobs = {job_id: queue}
+        response = asyncio.run(self.module.job_complete_video_endpoint(request))
+        return response, queue
+
+    def test_audio_is_decoded_and_queued_with_the_video(self):
+        parts = _video_parts(b"q" * 128)
+        parts.insert(4, _FakePart("audio", json.dumps({"sr": 48000}).encode()))
+        response, queue = self._run(_FakeRequest(parts))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.decoded, [{"sr": 48000}])
+        item = queue.get_nowait()
+        self.assertEqual(item["audio"], {"waveform": "decoded", "sample_rate": 48000})
+
+    def test_no_audio_field_means_no_audio_on_the_queue_item(self):
+        response, queue = self._run(_FakeRequest(_video_parts(b"q" * 128)))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.decoded, [])
+        self.assertIsNone(queue.get_nowait()["audio"])
+
+    def test_malformed_audio_is_a_400_and_discards_the_partial_file(self):
+        parts = _video_parts(b"q" * 128)
+        parts.insert(4, _FakePart("audio", b"{not json"))
+        response, queue = self._run(_FakeRequest(parts))
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("audio", str(response.payload["message"]))
+        self.assertEqual(list(self.output_dir.iterdir()), [])
+        self.assertTrue(queue.empty())
+
+
+class JobCompleteVideoProgressTests(unittest.TestCase):
+    """One POST replaced one-per-frame, so debug logging is the only progress signal."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self._tmp.name)
+        self.module = _load_job_routes_module(self.output_dir)
+        self.logged = []
+        self.module.debug_log = self.logged.append
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, request, job_id="vid-job"):
+        queue = asyncio.Queue()
+        self.module._prompt_server.distributed_pending_jobs = {job_id: queue}
+        return asyncio.run(self.module.job_complete_video_endpoint(request)), queue
+
+    def test_progress_is_reported_every_interval(self):
+        self.module.VIDEO_PROGRESS_INTERVAL = 1024
+        body = b"x" * 4096
+        self._run(_FakeRequest(_video_parts(body, chunk_size=256)))
+
+        progress = [m for m in self.logged if "receiving" in m]
+        self.assertEqual(len(progress), 4, self.logged)
+        self.assertIn("MiB", progress[0])
+
+    def test_a_percentage_is_shown_when_content_length_is_known(self):
+        self.module.VIDEO_PROGRESS_INTERVAL = 1024
+        body = b"x" * 2048
+        request = _FakeRequest(
+            _video_parts(body, chunk_size=512), headers={"content-length": str(len(body))}
+        )
+        self._run(request)
+
+        progress = [m for m in self.logged if "receiving" in m]
+        self.assertTrue(any("%" in m for m in progress), progress)
+
+    def test_no_percentage_without_content_length(self):
+        self.module.VIDEO_PROGRESS_INTERVAL = 1024
+        self._run(_FakeRequest(_video_parts(b"x" * 2048, chunk_size=512)))
+
+        progress = [m for m in self.logged if "receiving" in m]
+        self.assertTrue(progress)
+        self.assertFalse(any("%" in m for m in progress), progress)
+
+    def test_a_small_file_reports_only_completion(self):
+        self._run(_FakeRequest(_video_parts(b"x" * 64)))
+
+        self.assertEqual([m for m in self.logged if "receiving" in m], [])
+        self.assertTrue(any("bytes complete" in m for m in self.logged), self.logged)
+
+    def test_an_orphaned_file_names_where_it_was_kept(self):
+        """A 404 keeps the bytes; without the path it is an orphan nobody can find."""
+        self.module._prompt_server.distributed_pending_jobs = {}
+        response = asyncio.run(
+            self.module.job_complete_video_endpoint(_FakeRequest(_video_parts(b"x" * 64)))
+        )
+
+        self.assertEqual(response.status, 404)
+        kept = [m for m in self.logged if "is kept at" in m]
+        self.assertTrue(kept, self.logged)
+        self.assertIn("clip_00001.mp4", kept[0])
+
+    def test_progress_logging_goes_through_debug_log_only(self):
+        """It must be silent unless the node's debug mode is on."""
+        import inspect
+
+        source = inspect.getsource(self.module.job_complete_video_endpoint)
+        self.assertIn("debug_log(", source)
+        self.assertNotIn("\\n        log(", source)
 
 
 if __name__ == "__main__":

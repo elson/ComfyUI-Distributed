@@ -48,14 +48,31 @@ def test_one_collected_clip_becomes_a_video_handle():
     assert video.path == "/out/clip_00001.mp4"
 
 
-def test_several_clips_become_a_list_for_core_to_concatenate():
+def test_several_clips_are_not_joined():
+    """N workers produce N variants of a clip, not N segments of one.
+
+    Nothing splits a video across workers - there is no frame-range divider, and
+    DistributedSeed gives each participant its own seed - so concatenating them would be
+    joining unrelated takes. The handle carries the first; filenames carries all of them.
+    """
     module = _with_fake_input_impl(_load_collector_module())
     collector = module.DistributedCollectorNode()
 
     video = collector._video_object((True, ["/out/a.mp4", "/out/b.mp4"]))
 
-    assert isinstance(video, _FakeVideoFromList)
-    assert [v.path for v in video.videos] == ["/out/a.mp4", "/out/b.mp4"]
+    assert isinstance(video, _FakeVideoFromFile)
+    assert video.path == "/out/a.mp4"
+
+
+def test_several_clips_are_reported_rather_than_dropped_quietly():
+    module = _with_fake_input_impl(_load_collector_module())
+    collector = module.DistributedCollectorNode()
+    messages = []
+    module.log = messages.append
+
+    collector._video_object((True, ["/out/a.mp4", "/out/b.mp4"]))
+
+    assert any("2 separate clips" in m and "a.mp4" in m for m in messages), messages
 
 
 def test_no_video_means_no_handle():
