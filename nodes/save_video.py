@@ -12,13 +12,14 @@ class DistributedSaveVideo:
     This is the video counterpart of SaveImage, and exists for the same reason. A
     DistributedCollector hands back what it collected without writing it anywhere: images
     stay tensors until a SaveImage node saves them, and a video stays in the temp directory
-    the job_complete_video route staged it in until this node moves it. Receiving a file is
-    not the same as saving one, and where it lands is the workflow's decision, not the
-    transport's.
+    the job_complete_video route staged it in until this node publishes it. Receiving a
+    file is not the same as saving one, and where it lands is the workflow's decision, not
+    the transport's.
 
-    Nothing is decoded or re-encoded. The file is moved when it is already on the same
-    filesystem and copied otherwise, so a 45s clip costs a rename rather than an ffmpeg
-    pass - which is the entire point of collecting a finished video instead of frames.
+    Nothing is decoded or re-encoded, and the staged file is left where it was found. A
+    hardlink is used when the output directory is on the staging filesystem and a copy
+    otherwise, so a 45s clip costs a link or one copy rather than an ffmpeg pass - which is
+    the entire point of collecting a finished video instead of frames.
     """
 
     @classmethod
@@ -76,9 +77,9 @@ class DistributedSaveVideo:
                 destination, subfolder, filename = self._destination_for(
                     source, filename_prefix, output_dir
                 )
-                self._relocate(source, destination)
+                how = self._publish(source, destination)
                 folder_type = "output"
-                debug_log(f"SaveVideo - {source} -> {destination}")
+                debug_log(f"SaveVideo - {how} {source} -> {destination}")
             else:
                 # Preview only: leave the staged file where the route put it and describe it
                 # in place, the way Video Combine reports a temp file when save_output is off.
@@ -181,19 +182,28 @@ class DistributedSaveVideo:
         return os.path.join(full_output_folder, name), subfolder, name
 
     @staticmethod
-    def _relocate(source, destination):
-        """Move within a filesystem, copy across one. Never re-encode.
+    def _publish(source, destination):
+        """Put the clip at destination without consuming the staged original.
 
-        os.replace fails with EXDEV when the temp directory and the output directory are on
-        different filesystems, which is the normal case when output is a network share, so
-        fall back to a copy and remove the staged file afterwards.
+        The staged file is deliberately left in place. It is not this node's to destroy:
+        the collector's outputs are handles onto that one file - the VIDEO output is a
+        VideoFromFile holding its path, and the filenames output lists it - so removing it
+        would make those outputs single-use and, because both save nodes are OUTPUT_NODEs
+        with no edge between them, dependent on which the executor happens to reach first.
+        Wiring a collector to this node and to core's SaveVideo used to succeed or fail
+        that way, raising FileNotFoundError from av.open on whichever ran second. An IMAGE
+        tensor feeds SaveImage, PreviewImage and an upscaler at once; a collected video now
+        behaves the same way.
+
+        The cost of keeping it is bounded: the staging directory is ComfyUI's temp, which
+        is cleared on restart like any other temp file. A hardlink makes it free outright
+        when output shares the staging filesystem, and os.link raises EXDEV when it does
+        not - the normal case, since output is usually a network share.
         """
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         try:
-            os.replace(source, destination)
+            os.link(source, destination)
+            return "linked"
         except OSError:
             shutil.copy2(source, destination)
-            try:
-                os.remove(source)
-            except OSError:
-                debug_log(f"SaveVideo - could not remove staged file {source}")
+            return "copied"
