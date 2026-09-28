@@ -1,8 +1,9 @@
 """DistributedSaveVideo: the video counterpart of SaveImage.
 
 A collected clip is staged in the temp dir by the job_complete_video route and is not
-saved until this node moves it, the same way a collected IMAGE is not written until a
-SaveImage node writes it. Nothing here decodes or re-encodes.
+saved until this node publishes it, the same way a collected IMAGE is not written until a
+SaveImage node writes it. Nothing here decodes or re-encodes, and nothing consumes the
+staged file - other nodes may be reading the same path.
 """
 
 import importlib.util
@@ -106,15 +107,45 @@ class SaveVideoTests(unittest.TestCase):
 
     # -- saving ----------------------------------------------------------------
 
-    def test_it_moves_the_staged_file_into_output(self):
+    def test_it_publishes_the_staged_file_into_output(self):
         staged = self._staged(body=b"payload")
         result = self.node.save((True, [str(staged)]), "video/ComfyUI")
 
         saved = self.root / "output" / "video" / "ComfyUI_00001.mp4"
         self.assertTrue(saved.exists(), list((self.root / "output").rglob("*")))
         self.assertEqual(saved.read_bytes(), b"payload")
-        self.assertFalse(staged.exists(), "the staged copy should not be left behind")
         self.assertEqual(result["result"][0], (True, [str(saved)]))
+
+    def test_saving_leaves_the_staged_file_for_other_consumers(self):
+        """The reported bug: core SaveVideo on the collector's VIDEO output blew up.
+
+        Both save nodes are OUTPUT_NODEs reading the same staged path with no edge
+        between them, so consuming it made the graph succeed or fail on execution order.
+        The collector's VIDEO output is a VideoFromFile holding this exact path, and
+        av.open raised FileNotFoundError from get_dimensions when this node had already
+        taken the file away.
+        """
+        staged = self._staged(body=b"payload")
+        self.node.save((True, [str(staged)]), "video/ComfyUI")
+
+        self.assertTrue(
+            staged.exists(),
+            "the staged file must survive: the collector's VIDEO output points at it",
+        )
+        self.assertEqual(staged.read_bytes(), b"payload")
+
+    def test_two_save_nodes_can_publish_the_same_clip_in_either_order(self):
+        """Two consumers is the case that broke; neither ordering may fail."""
+        staged = self._staged(body=b"payload")
+
+        first = self.node.save((True, [str(staged)]), "video/one")
+        second = self.node.save((True, [str(staged)]), "video/two")
+
+        for result in (first, second):
+            saved = Path(result["result"][0][1][0])
+            self.assertTrue(saved.exists())
+            self.assertEqual(saved.read_bytes(), b"payload")
+        self.assertTrue(staged.exists())
 
     def test_the_source_extension_is_preserved(self):
         staged = self._staged(name="clip.webm")
@@ -201,23 +232,32 @@ class SaveVideoTests(unittest.TestCase):
         result = self.node.save([(True, [str(staged)])], "video/ComfyUI")
         self.assertEqual(len(result["result"][0][1]), 1)
 
-    def test_a_copy_is_used_when_the_move_fails(self):
-        """output is frequently a network share, so os.replace can fail with EXDEV."""
+    def test_a_hardlink_is_used_when_output_shares_the_staging_filesystem(self):
+        """Then publishing the clip costs no bytes at all."""
         staged = self._staged(body=b"payload")
-        original_replace = self.module.os.replace
+        self.node.save((True, [str(staged)]), "video/ComfyUI")
 
-        def failing_replace(src, dst):
+        saved = self.root / "output" / "video" / "ComfyUI_00001.mp4"
+        self.assertEqual(staged.stat().st_ino, saved.stat().st_ino)
+
+    def test_a_copy_is_used_when_the_link_fails(self):
+        """output is frequently a network share, so os.link fails with EXDEV there."""
+        staged = self._staged(body=b"payload")
+        original_link = self.module.os.link
+
+        def failing_link(src, dst):
             raise OSError(18, "Invalid cross-device link")
 
-        self.module.os.replace = failing_replace
+        self.module.os.link = failing_link
         try:
             self.node.save((True, [str(staged)]), "video/ComfyUI")
         finally:
-            self.module.os.replace = original_replace
+            self.module.os.link = original_link
 
         saved = self.root / "output" / "video" / "ComfyUI_00001.mp4"
         self.assertEqual(saved.read_bytes(), b"payload")
-        self.assertFalse(staged.exists(), "the staged copy should be removed after copying")
+        self.assertNotEqual(staged.stat().st_ino, saved.stat().st_ino)
+        self.assertTrue(staged.exists(), "a copy must still leave the original staged")
 
 
 if __name__ == "__main__":

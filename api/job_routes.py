@@ -335,8 +335,9 @@ async def job_complete_video_endpoint(request):
 
     **Temp, not output, on purpose.** Receiving a file is not the same as saving it. A
     collected IMAGE is not written anywhere until a SaveImage node says so, and a collected
-    video behaves the same way: it is staged here and DistributedSaveVideo moves it into the
-    output directory under a filename_prefix the user controls. Writing straight to output
+    video behaves the same way: it is staged here and DistributedSaveVideo publishes it into
+    the output directory under a filename_prefix the user controls, leaving this staged copy
+    alone so the collector's other outputs keep working. Writing straight to output
     would save every clip whether or not the graph asked for one, and would take the choice
     of where it lands away from the workflow.
 
